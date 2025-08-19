@@ -17,13 +17,16 @@ IMAGE_PATH = "/kaggle/input/mydataset/dog.jpeg"
 speech_output_path = "speech_answer.wav"
 speed = 1.0
 
+# Determine device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 # Load model and tokenizer
 def load_model_and_tokenizer(model_path):
     model = LlavaQwen2ForCausalLM.from_pretrained(
-        model_path, low_cpu_mem_usage=True, device_map='cuda', trust_remote_code=True
+        model_path, low_cpu_mem_usage=True, device_map=device, trust_remote_code=True
     )
     vision_tower = model.get_vision_tower()
-    vision_tower.load_model(device_map="cuda:0")
+    vision_tower.load_model(device_map=device)
     image_processor = vision_tower.image_processor
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     return model, tokenizer, image_processor
@@ -45,20 +48,20 @@ def resize_image_if_necessary(image):
 # Load image from path
 def load_image_from_path(path):
     try:
-        return resize_image_if_necessary(Image.open(path))
+        return resize_image_if_necessary(Image.open(path).convert("RGB"))
     except Exception as e:
         print(f"Error loading image from file path: {e}")
         return None
 
 # Generate text
-def generate_text(model, tokenizer, image, prompt, max_new_tokens=1024):
-    if image is not None:
-        image = image.unsqueeze(0).float().to("cuda:0")
+def generate_text(model, tokenizer, image_tensor, prompt, max_new_tokens=1024):
+    if image_tensor is not None:
+        image_tensor = image_tensor.unsqueeze(0).float().to(device)
     input_ids = tokenizer([prompt], return_tensors="pt", add_special_tokens=False)["input_ids"]
-    input_ids = input_ids.to("cuda:0")
+    input_ids = input_ids.to(device)
     outputs = model.generate(
         inputs=input_ids,
-        images=image,
+        images=image_tensor,
         max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=0.7,
@@ -70,9 +73,8 @@ def generate_text(model, tokenizer, image, prompt, max_new_tokens=1024):
 # Main execution
 def main():
     model, tokenizer, image_processor = load_model_and_tokenizer(MODEL_PATH)
-    text_to_audio_model = TTS(language='EN', device="cuda:0")
-    speaker_ids = text_to_audio_model.hps.data.spk2id
-
+    text_to_audio_model = TTS(language='EN', device=device)
+    
     print("************************************************* IM READY! *************************************************\n")
 
     # Load and process image
@@ -92,8 +94,8 @@ def main():
     print(generated_text)
 
     # Convert generated text to speech
-    decode_speech(generated_text, "cuda:0", speech_output_path)
+    decode_speech(generated_text, device, speech_output_path)
     print(f"Speech saved to {speech_output_path}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
