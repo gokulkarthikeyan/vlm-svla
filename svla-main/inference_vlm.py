@@ -1,6 +1,13 @@
-import torch
-from PIL import Image
+# =========================================================
+# SVLA Multimodal Inference - Kaggle Non-Interactive Script
+# =========================================================
+
 import os
+import torch
+import librosa
+import numpy as np
+import soundfile as sf
+from PIL import Image
 from transformers import AutoTokenizer
 from llava.model import LlavaQwen2ForCausalLM
 from melo.api import TTS
@@ -8,67 +15,103 @@ from inference.audio_encoder import audio_encoder
 from inference.tokens_to_audio import decode_speech
 
 # ----------------------- CONFIG -----------------------
-MODEL_PATH = "./weights/svla-sft-text-ins/svla-sft-text-ins"   # ✅ adjust path after unzip
-IMAGE_PATH = "/kaggle/input/mydataset/dog.jpeg"                # ✅ your dataset image
-PROMPT = "Summarize the picture."
-# ------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_PATH = "/kaggle/working/weights/svla-sft-text-ins"
+IMAGE_PATH = "/kaggle/input/mydataset/dog.jpeg"
+AUDIO_INPUT_PATH = "/kaggle/input/mydataset/sample.wav"  # optional
+OUTPUT_SPEECH_PATH = "/kaggle/working/generated_response.wav"
 
-def resize_image_if_necessary(image):
-    original_width, original_height = image.size
-    longest_dimension = 896
-    if original_width <= longest_dimension and original_height <= longest_dimension:
+# ----------------------- UTILS -----------------------
+def load_image(image_path):
+    try:
+        image = Image.open(image_path).convert("RGB")
+        print(f"[INFO] Loaded image: {image_path}")
         return image
-    if original_width > original_height:
-        new_width = longest_dimension
-        new_height = int((longest_dimension / original_width) * original_height)
-    else:
-        new_height = longest_dimension
-        new_width = int((longest_dimension / original_height) * original_width)
-    return image.resize((new_width, new_height))
+    except Exception as e:
+        print(f"[ERROR] Failed to load image {image_path}: {e}")
+        return None
 
-def load_model_and_tokenizer(model_path):
-    model = LlavaQwen2ForCausalLM.from_pretrained(model_path, 
-                                                  low_cpu_mem_usage=True, 
-                                                  device_map='cuda', 
-                                                  trust_remote_code=True)
-    vision_tower = model.get_vision_tower()
-    vision_tower.load_model(device_map="cuda:0")
-    image_processor = vision_tower.image_processor
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    return model, tokenizer, image_processor
+def load_audio(audio_path, target_sr=16000):
+    try:
+        audio, sr = librosa.load(audio_path, sr=target_sr)
+        print(f"[INFO] Loaded audio: {audio_path} (sr={sr})")
+        return audio
+    except Exception as e:
+        print(f"[ERROR] Failed to load audio {audio_path}: {e}")
+        return None
 
-def generate_text(model, tokenizer, image, prompt, max_new_tokens=512):
-    if image is not None:
-        image = image.unsqueeze(0).float().to("cuda:0")
-    input_ids = tokenizer([prompt], return_tensors="pt", add_special_tokens=False)["input_ids"]
-    input_ids = input_ids.to("cuda:0")
+def save_audio(waveform, path, sr=16000):
+    try:
+        sf.write(path, waveform, sr)
+        print(f"[INFO] Saved audio: {path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save audio {path}: {e}")
+
+# ----------------------- LOAD MODEL -----------------------
+print("[STEP 1] Loading SVLA model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+model = LlavaQwen2ForCausalLM.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+    low_cpu_mem_usage=True
+).to(DEVICE).eval()
+print("[INFO] Model loaded successfully!")
+
+# ----------------------- INPUTS -----------------------
+print("[STEP 2] Preparing inputs...")
+
+# Image
+image = load_image(IMAGE_PATH)
+
+# Audio (optional)
+audio = None
+if os.path.exists(AUDIO_INPUT_PATH):
+    audio = load_audio(AUDIO_INPUT_PATH)
+
+# Text prompt
+text_prompt = "What do you see in this image?"
+print(f"[INFO] Text prompt: {text_prompt}")
+
+# ----------------------- INFERENCE -----------------------
+print("[STEP 3] Running inference...")
+
+inputs = tokenizer(
+    text_prompt,
+    return_tensors="pt"
+).to(DEVICE)
+
+# Encode image
+if image is not None:
+    image_embeds = model.encode_images([image])
+else:
+    image_embeds = None
+
+# Encode audio
+if audio is not None:
+    audio_tokens = audio_encoder.get_code_from_wav(audio)
+    audio_embeds = model.encode_audios([audio_tokens])
+else:
+    audio_embeds = None
+
+# Forward pass
+with torch.no_grad():
     outputs = model.generate(
-        inputs=input_ids,
-        images=image,
-        max_new_tokens=max_new_tokens,
-        temperature=0.7,
-        top_p=1.0,
-        repetition_penalty=1.2,
-        do_sample=True
+        **inputs,
+        max_new_tokens=200,
+        do_sample=True,
+        temperature=0.7
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def main():
-    print("Loading model...")
-    model, tokenizer, image_processor = load_model_and_tokenizer(MODEL_PATH)
+generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"[RESULT] Model output:\n{generated_text}")
 
-    print("Loading image...")
-    image = resize_image_if_necessary(Image.open(IMAGE_PATH))
-    image = image_processor(image, return_tensors='pt')["pixel_values"][0]
+# ----------------------- SPEECH OUTPUT -----------------------
+print("[STEP 4] Converting text to speech...")
+try:
+    tts = TTS(language="EN", device=DEVICE)
+    tts_out = tts.tts(generated_text)
+    save_audio(tts_out, OUTPUT_SPEECH_PATH)
+except Exception as e:
+    print(f"[ERROR] TTS failed: {e}")
 
-    print("Generating answer...")
-    system = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
-    formatted_prompt = f"{system}\n<|im_start|>user\n<image>\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n"
-
-    output = generate_text(model, tokenizer, image, formatted_prompt)
-    print("\n===== MODEL OUTPUT =====\n")
-    print(output)
-    print("\n========================\n")
-
-if __name__ == "__main__":
-    main()
+print("[DONE] Inference pipeline finished successfully!")
