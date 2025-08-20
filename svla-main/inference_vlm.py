@@ -16,7 +16,7 @@ from inference.tokens_to_audio import decode_speech
 
 # ----------------------- CONFIG -----------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "/kaggle/working/weights/svla-sft-text-ins"
+MODEL_PATH = "/kaggle/working/vlm-svla/svla-main/weights/svla-sft-text-ins"
 IMAGE_PATH = "/kaggle/input/mydataset/dog.jpeg"
 AUDIO_INPUT_PATH = "/kaggle/input/mydataset/sample.wav"  # optional
 OUTPUT_SPEECH_PATH = "/kaggle/working/generated_response.wav"
