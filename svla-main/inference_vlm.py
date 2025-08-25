@@ -1,5 +1,5 @@
 # =========================================================
-# SVLA Multimodal Inference - Kaggle Non-Interactive Script
+# SVLA Multimodal Inference - Kaggle Script (Fixed)
 # =========================================================
 
 import os
@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from llava.model import LlavaQwen2ForCausalLM
 from melo.api import TTS
 from inference.audio_encoder import audio_encoder
+from inference.tokens_to_audio import decode_speech
 
 # ----------------------- CONFIG -----------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,10 +35,10 @@ def load_audio(audio_path, target_sr=16000):
     try:
         audio, sr = librosa.load(audio_path, sr=target_sr)
         print(f"[INFO] Loaded audio: {audio_path} (sr={sr})")
-        return audio, sr
+        return audio
     except Exception as e:
         print(f"[ERROR] Failed to load audio {audio_path}: {e}")
-        return None, None
+        return None
 
 def save_audio(waveform, path, sr=16000):
     try:
@@ -63,9 +64,9 @@ print("[STEP 2] Preparing inputs...")
 image = load_image(IMAGE_PATH)
 
 # Audio (optional)
-audio, sr = None, None
+audio = None
 if os.path.exists(AUDIO_INPUT_PATH):
-    audio, sr = load_audio(AUDIO_INPUT_PATH)
+    audio = load_audio(AUDIO_INPUT_PATH)
 
 # Text prompt
 text_prompt = "What do you see in this image?"
@@ -74,32 +75,42 @@ print(f"[INFO] Text prompt: {text_prompt}")
 # ----------------------- INFERENCE -----------------------
 print("[STEP 3] Running inference...")
 
-# Build multimodal prompt
-prompt = text_prompt
-if image is not None:
-    prompt = "<image>\n" + prompt
-if audio is not None:
-    prompt = "<audio>\n" + prompt
-
 inputs = tokenizer(
-    prompt,
+    text_prompt,
     return_tensors="pt"
 ).to(DEVICE)
 
-# Encode audio into tokens if present
+# Prepare multimodal kwargs
+modal_kwargs = {}
+
+# Encode image
+if image is not None:
+    try:
+        image_embeds = model.encode_images([image])
+        modal_kwargs["images"] = image_embeds
+        print("[INFO] Image embeddings ready")
+    except Exception as e:
+        print(f"[WARN] Failed image encoding: {e}")
+
+# Encode audio
 if audio is not None:
-    audio_tokens = audio_encoder.get_code_from_wav(audio, sr)
-    # insert tokens into inputs (model handles alignment)
-    # depends on svla implementation, simplified here:
-    inputs["audio_tokens"] = torch.tensor(audio_tokens).unsqueeze(0).to(DEVICE)
+    try:
+        audio_tokens = audio_encoder.get_code_from_wav(audio)
+        audio_embeds = model.encode_audios([audio_tokens])
+        modal_kwargs["audios"] = audio_embeds
+        print("[INFO] Audio embeddings ready")
+    except Exception as e:
+        print(f"[WARN] Failed audio encoding: {e}")
 
 # Forward pass
 with torch.no_grad():
     outputs = model.generate(
-        **inputs,
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
         max_new_tokens=200,
         do_sample=True,
-        temperature=0.7
+        temperature=0.7,
+        **modal_kwargs  # <-- inject multimodal embeddings
     )
 
 generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -109,7 +120,7 @@ print(f"[RESULT] Model output:\n{generated_text}")
 print("[STEP 4] Converting text to speech...")
 try:
     tts = TTS(language="EN", device=DEVICE)
-    tts_out = tts.tts(generated_text)  # returns numpy waveform
+    tts_out = tts.tts(generated_text)
     save_audio(tts_out, OUTPUT_SPEECH_PATH)
 except Exception as e:
     print(f"[ERROR] TTS failed: {e}")
