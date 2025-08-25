@@ -12,7 +12,6 @@ from transformers import AutoTokenizer
 from llava.model import LlavaQwen2ForCausalLM
 from melo.api import TTS
 from inference.audio_encoder import audio_encoder
-from inference.tokens_to_audio import decode_speech
 
 # ----------------------- CONFIG -----------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -35,10 +34,10 @@ def load_audio(audio_path, target_sr=16000):
     try:
         audio, sr = librosa.load(audio_path, sr=target_sr)
         print(f"[INFO] Loaded audio: {audio_path} (sr={sr})")
-        return audio
+        return audio, sr
     except Exception as e:
         print(f"[ERROR] Failed to load audio {audio_path}: {e}")
-        return None
+        return None, None
 
 def save_audio(waveform, path, sr=16000):
     try:
@@ -64,9 +63,9 @@ print("[STEP 2] Preparing inputs...")
 image = load_image(IMAGE_PATH)
 
 # Audio (optional)
-audio = None
+audio, sr = None, None
 if os.path.exists(AUDIO_INPUT_PATH):
-    audio = load_audio(AUDIO_INPUT_PATH)
+    audio, sr = load_audio(AUDIO_INPUT_PATH)
 
 # Text prompt
 text_prompt = "What do you see in this image?"
@@ -75,23 +74,24 @@ print(f"[INFO] Text prompt: {text_prompt}")
 # ----------------------- INFERENCE -----------------------
 print("[STEP 3] Running inference...")
 
+# Build multimodal prompt
+prompt = text_prompt
+if image is not None:
+    prompt = "<image>\n" + prompt
+if audio is not None:
+    prompt = "<audio>\n" + prompt
+
 inputs = tokenizer(
-    text_prompt,
+    prompt,
     return_tensors="pt"
 ).to(DEVICE)
 
-# Encode image
-if image is not None:
-    image_embeds = model.encode_images([image])
-else:
-    image_embeds = None
-
-# Encode audio
+# Encode audio into tokens if present
 if audio is not None:
-    audio_tokens = audio_encoder.get_code_from_wav(audio)
-    audio_embeds = model.encode_audios([audio_tokens])
-else:
-    audio_embeds = None
+    audio_tokens = audio_encoder.get_code_from_wav(audio, sr)
+    # insert tokens into inputs (model handles alignment)
+    # depends on svla implementation, simplified here:
+    inputs["audio_tokens"] = torch.tensor(audio_tokens).unsqueeze(0).to(DEVICE)
 
 # Forward pass
 with torch.no_grad():
@@ -109,7 +109,7 @@ print(f"[RESULT] Model output:\n{generated_text}")
 print("[STEP 4] Converting text to speech...")
 try:
     tts = TTS(language="EN", device=DEVICE)
-    tts_out = tts.tts(generated_text)
+    tts_out = tts.tts(generated_text)  # returns numpy waveform
     save_audio(tts_out, OUTPUT_SPEECH_PATH)
 except Exception as e:
     print(f"[ERROR] TTS failed: {e}")
