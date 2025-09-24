@@ -13,6 +13,8 @@ from llava.constants import (
 )
 import librosa
 from transformers import Wav2Vec2Tokenizer, Wav2Vec2ForCTC
+from melo.api import TTS
+import random
 
 # -------------------- device --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -42,7 +44,7 @@ else:
 audio_path = None
 for root, dirs, files in os.walk("/kaggle/input"):
     for f in files:
-        if f.lower().endswith((".wav", ".mp3", ".flac")):  # adjust if you have fixed filename
+        if f.lower().endswith((".wav", ".mp3", ".flac")):
             audio_path = os.path.join(root, f)
             break
 
@@ -51,8 +53,8 @@ if audio_path:
 else:
     print("No audio file found, skipping audio input.")
 
-# -------------------- load model --------------------
-MODEL_PATH = "./weights/svla-sft-text-ins"  # make sure weights are unzipped here
+# -------------------- load SVLA model --------------------
+MODEL_PATH = "./weights/svla-sft-text-ins"  # ensure weights are available
 model = LlavaQwen2ForCausalLM.from_pretrained(
     MODEL_PATH, low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True
 )
@@ -69,6 +71,7 @@ if audio_path:
     # load audio at 16k
     audio, sr = librosa.load(audio_path, sr=16000)
     input_values = asr_tokenizer(audio, return_tensors="pt", padding="longest").input_values.to(device)
+
     with torch.no_grad():
         logits = asr_model(input_values).logits
     predicted_ids = torch.argmax(logits, dim=-1)
@@ -78,15 +81,14 @@ else:
     audio_text = ""
 
 # -------------------- prepare prompt --------------------
-prompt_text = "Describe this image and audio." if (image and audio_text) else \
-              "Describe this image." if image else \
-              "Understand this audio." if audio_text else \
-              "Hello."
-
-formatted_prompt = (
-    f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    f"<|im_start|>user\n"
+prompt_text = (
+    "Describe this image and audio." if (image and audio_text) else
+    "Describe this image." if image else
+    "Understand this audio." if audio_text else
+    "Hello."
 )
+
+formatted_prompt = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
 
 if image:
     formatted_prompt += f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n"
@@ -109,4 +111,14 @@ outputs = model.generate(
 )
 response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-print("\nOUTPUT:\n", response)
+print("\nOUTPUT (Text):\n", response)
+
+# -------------------- text to speech --------------------
+tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "cpu")
+speaker_ids = tts_model.hps.data.spk2id
+speaker = random.choice(['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default'])
+
+output_audio_path = "model_output.wav"
+tts_model.tts_to_file(response, speaker_ids[speaker], output_audio_path, speed=1.0)
+
+print(f"OUTPUT (Speech saved at): {output_audio_path}")
