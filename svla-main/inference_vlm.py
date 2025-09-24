@@ -15,6 +15,10 @@ import librosa
 from transformers import Wav2Vec2Tokenizer, Wav2Vec2ForCTC
 from melo.api import TTS
 import random
+import nltk
+
+# -------------------- fix for Melo TTS --------------------
+nltk.download('averaged_perceptron_tagger_eng')
 
 # -------------------- device --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,7 +58,7 @@ else:
     print("No audio file found, skipping audio input.")
 
 # -------------------- load SVLA model --------------------
-MODEL_PATH = "./weights/svla-sft-text-ins"  # ensure weights are available
+MODEL_PATH = "./weights/svla-sft-text-ins"  # make sure weights are unzipped here
 model = LlavaQwen2ForCausalLM.from_pretrained(
     MODEL_PATH, low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True
 )
@@ -68,7 +72,7 @@ if audio_path:
     asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
     asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
 
-    # load audio at 16k
+    # load audio at 16kHz
     audio, sr = librosa.load(audio_path, sr=16000)
     input_values = asr_tokenizer(audio, return_tensors="pt", padding="longest").input_values.to(device)
 
@@ -98,7 +102,7 @@ if audio_text:
 
 formatted_prompt += f"{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
 
-# -------------------- generate --------------------
+# -------------------- generate text --------------------
 input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False).to(device)
 img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device) if image else None
 
@@ -113,7 +117,7 @@ response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
 print("\nOUTPUT (Text):\n", response)
 
-# -------------------- text to speech --------------------
+# -------------------- generate speech --------------------
 tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "cpu")
 speaker_ids = tts_model.hps.data.spk2id
 speaker = random.choice(['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default'])
