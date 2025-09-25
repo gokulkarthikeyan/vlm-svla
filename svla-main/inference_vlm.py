@@ -1,4 +1,3 @@
-
 import os
 import random
 import torch
@@ -25,11 +24,25 @@ nltk.download('averaged_perceptron_tagger_eng')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# -------------------- Load Datasets --------------------
-# Flickr8k captions CSV (uploaded to Kaggle input folder)
-flickr_df = pd.read_csv("/kaggle/input/flickr8k/flickr8k_captions.csv")
+# -------------------- Process Flickr8k Captions --------------------
+caption_file = "/kaggle/input/flickr8k/captions.txt"
+captions = []
+with open(caption_file, 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        img_cap = line.split("\t")
+        if len(img_cap) != 2:
+            continue
+        img_name = img_cap[0].split("#")[0]  # remove #0, #1 etc.
+        caption = img_cap[1]
+        captions.append({"image_file": img_name, "caption": caption})
 
-# People's Speech dataset (subset for demo)
+flickr_df = pd.DataFrame(captions)
+print("Flickr8k captions processed:", flickr_df.head())
+
+# -------------------- Load People's Speech Dataset --------------------
 speech_ds = load_dataset("MLCommons/peoples_speech_v1.0", split="train[:1%]")
 
 # -------------------- Prepare Multimodal Dataset --------------------
@@ -78,7 +91,7 @@ all_refs = []
 
 for i, sample in multimodal_df.iterrows():
     # --- Load image ---
-    image = Image.open(f"/kaggle/input/flickr8k/images/{sample['image_file']}").convert("RGB")
+    image = Image.open(f"/kaggle/input/flickr8k/Images/{sample['image_file']}").convert("RGB")
     img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device)
     
     # --- Load and transcribe audio ---
