@@ -1,7 +1,11 @@
 import os
+import random
 import torch
+import nltk
+import librosa
 from PIL import Image
-from transformers import AutoTokenizer
+from datasets import load_dataset
+from transformers import AutoTokenizer, Wav2Vec2Tokenizer, Wav2Vec2ForCTC
 from llava.model import LlavaQwen2ForCausalLM
 from llava.constants import (
     DEFAULT_IM_START_TOKEN,
@@ -11,11 +15,8 @@ from llava.constants import (
     DEFAULT_AUDIO_END_TOKEN,
     DEFAULT_AUDIO_TOKEN,
 )
-import librosa
-from transformers import Wav2Vec2Tokenizer, Wav2Vec2ForCTC
 from melo.api import TTS
-import random
-import nltk
+import evaluate
 
 # -------------------- fix for Melo TTS --------------------
 nltk.download('averaged_perceptron_tagger_eng')
@@ -24,41 +25,11 @@ nltk.download('averaged_perceptron_tagger_eng')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# -------------------- find image --------------------
-img_path = None
-for root, dirs, files in os.walk("/kaggle/input"):
-    for f in files:
-        if f.lower() == "dog.jpeg":   # adjust name if needed
-            img_path = os.path.join(root, f)
-            break
-if img_path:
-    print("Using image:", img_path)
-    image = Image.open(img_path).convert("RGB")
-    # resize if too large
-    max_dim = 896
-    w, h = image.size
-    if max(w, h) > max_dim:
-        scale = max_dim / max(w, h)
-        image = image.resize((int(w * scale), int(h * scale)))
-else:
-    image = None
-    print("No image found, skipping image input.")
-
-# -------------------- find audio --------------------
-audio_path = None
-for root, dirs, files in os.walk("/kaggle/input"):
-    for f in files:
-        if f.lower().endswith((".wav", ".mp3", ".flac")):
-            audio_path = os.path.join(root, f)
-            break
-
-if audio_path:
-    print("Using audio:", audio_path)
-else:
-    print("No audio file found, skipping audio input.")
+# -------------------- load dataset --------------------
+dataset = load_dataset("speechcoco", split="train[:1%]")  # subset for demo
 
 # -------------------- load SVLA model --------------------
-MODEL_PATH = "./weights/svla-sft-text-ins"  # make sure weights are unzipped here
+MODEL_PATH = "./weights/svla-sft-text-ins"  # weights must be uploaded
 model = LlavaQwen2ForCausalLM.from_pretrained(
     MODEL_PATH, low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True
 )
@@ -68,61 +39,91 @@ image_processor = vision_tower.image_processor
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
 # -------------------- load ASR model --------------------
-if audio_path:
-    asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
-    asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
+asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
+asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
 
-    # load audio at 16kHz
-    audio, sr = librosa.load(audio_path, sr=16000)
-    input_values = asr_tokenizer(audio, return_tensors="pt", padding="longest").input_values.to(device)
+# -------------------- metrics --------------------
+accuracy = evaluate.load("accuracy")
+precision = evaluate.load("precision")
+recall = evaluate.load("recall")
+bleu = evaluate.load("bleu")
+rouge = evaluate.load("rouge")
+meteor = evaluate.load("meteor")
+
+# -------------------- TTS model --------------------
+tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "cpu")
+speaker_ids = tts_model.hps.data.spk2id
+speakers = ['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default']
+
+# -------------------- training/evaluation loop --------------------
+all_preds = []
+all_refs = []
+
+for i, sample in enumerate(dataset.select(range(10))):  # just first 10 for demo
+    # --- image ---
+    image = Image.open(sample["image"]).convert("RGB")
+    img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device)
+
+    # --- audio ---
+    speech_array, sr = librosa.load(sample["audio"]["path"], sr=16000)
+    input_values = asr_tokenizer(speech_array, return_tensors="pt", padding="longest").input_values.to(device)
 
     with torch.no_grad():
         logits = asr_model(input_values).logits
     predicted_ids = torch.argmax(logits, dim=-1)
     audio_text = asr_tokenizer.decode(predicted_ids[0])
-    print("Transcribed Audio:", audio_text)
-else:
-    audio_text = ""
 
-# -------------------- prepare prompt --------------------
-prompt_text = (
-    "Describe this image and audio." if (image and audio_text) else
-    "Describe this image." if image else
-    "Understand this audio." if audio_text else
-    "Hello."
-)
+    # --- ground truth caption ---
+    reference_caption = sample["captions"][0]["text"]
 
-formatted_prompt = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+    # --- format prompt ---
+    formatted_prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n"
+        f"{DEFAULT_AUDIO_START_TOKEN}{DEFAULT_AUDIO_TOKEN*128}{DEFAULT_AUDIO_END_TOKEN}\n"
+        f"Transcribed speech: {audio_text}\n"
+        "Describe this image and audio.<|im_end|>\n<|im_start|>assistant\n"
+    )
 
-if image:
-    formatted_prompt += f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n"
-if audio_text:
-    formatted_prompt += f"{DEFAULT_AUDIO_START_TOKEN}{DEFAULT_AUDIO_TOKEN*128}{DEFAULT_AUDIO_END_TOKEN}\n"
-    formatted_prompt += f"Transcribed speech: {audio_text}\n"
+    input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False).to(device)
 
-formatted_prompt += f"{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+    # --- generate model output ---
+    outputs = model.generate(
+        inputs=input_ids["input_ids"],
+        images=img_tensor,
+        max_new_tokens=128,
+        do_sample=True,
+        temperature=0.7
+    )
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-# -------------------- generate text --------------------
-input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False).to(device)
-img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device) if image else None
+    # --- save speech output ---
+    speaker = random.choice(speakers)
+    tts_model.tts_to_file(response, speaker_ids[speaker], f"output_{i}.wav", speed=1.0)
 
-outputs = model.generate(
-    inputs=input_ids["input_ids"],
-    images=img_tensor,
-    max_new_tokens=512,
-    do_sample=True,
-    temperature=0.7
-)
-response = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    print(f"\nSample {i+1}")
+    print("Audio Transcript:", audio_text)
+    print("Reference Caption:", reference_caption)
+    print("Model Response:", response)
 
-print("\nOUTPUT (Text):\n", response)
+    # collect metrics
+    all_preds.append(response)
+    all_refs.append(reference_caption)
 
-# -------------------- generate speech --------------------
-tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "cpu")
-speaker_ids = tts_model.hps.data.spk2id
-speaker = random.choice(['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default'])
+# -------------------- compute metrics --------------------
+acc = accuracy.compute(predictions=all_preds, references=all_refs)
+prec = precision.compute(predictions=all_preds, references=all_refs, average="macro")
+rec = recall.compute(predictions=all_preds, references=all_refs, average="macro")
+bleu_score = bleu.compute(predictions=[p.split() for p in all_preds],
+                          references=[[r.split()] for r in all_refs])
+rouge_score = rouge.compute(predictions=all_preds, references=all_refs)
+meteor_score = meteor.compute(predictions=all_preds, references=all_refs)
 
-output_audio_path = "model_output.wav"
-tts_model.tts_to_file(response, speaker_ids[speaker], output_audio_path, speed=1.0)
-
-print(f"OUTPUT (Speech saved at): {output_audio_path}")
+print("\n==== Final Evaluation Metrics ====")
+print("Accuracy:", acc["accuracy"])
+print("Precision:", prec["precision"])
+print("Recall:", rec["recall"])
+print("Fluency (BLEU):", bleu_score["bleu"])
+print("ROUGE-L:", rouge_score["rougeL"])
+print("METEOR:", meteor_score["meteor"])
