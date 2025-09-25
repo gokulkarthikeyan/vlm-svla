@@ -1,5 +1,4 @@
 # -------------------- Install missing packages --------------------
-!pip install -q evaluate datasets soundfile librosa
 
 # -------------------- Imports --------------------
 import os
