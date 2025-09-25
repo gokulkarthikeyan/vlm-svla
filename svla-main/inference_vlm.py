@@ -1,7 +1,4 @@
-# -------------------- Install packages --------------------
-!pip install -q datasets evaluate pillow librosa soundfile meloTTS
 
-# -------------------- Imports --------------------
 import os
 import random
 import torch
