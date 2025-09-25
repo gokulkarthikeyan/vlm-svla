@@ -1,6 +1,3 @@
-# -------------------- Install missing packages --------------------
-
-# -------------------- Imports --------------------
 import os
 import random
 import torch
@@ -28,12 +25,29 @@ nltk.download('averaged_perceptron_tagger_eng')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# -------------------- Load Dataset --------------------
-# Using a small slice for demo (10 samples), expand later if GPU allows
-dataset = load_dataset("speechcoco", split="train[:1%]")
+# -------------------- Load Datasets --------------------
+# 1% subset to avoid Kaggle memory issues
+coco_ds = load_dataset("coco_captions", split="train[:1%]")  
+speech_ds = load_dataset("MLCommons/peoples_speech_v1.0", split="train[:1%]")
+
+# -------------------- Combine into multimodal triples --------------------
+multimodal_data = []
+for i in range(len(coco_ds)):
+    image_sample = coco_ds[i]
+    speech_sample = random.choice(speech_ds)
+
+    multimodal_data.append({
+        "image": image_sample["image"],           # PIL Image
+        "caption": image_sample["captions"][0]["text"],  # Image caption
+        "audio_path": speech_sample["audio"]["path"],    # WAV audio
+        "audio_text": speech_sample["text"]               # Transcript
+    })
+
+print("Total multimodal samples:", len(multimodal_data))
+print("Example sample:", multimodal_data[0])
 
 # -------------------- Load SVLA Model --------------------
-MODEL_PATH = "./weights/svla-sft-text-ins"  # make sure weights are uploaded to this path
+MODEL_PATH = "./weights/svla-sft-text-ins"  # upload your weights to Kaggle
 model = LlavaQwen2ForCausalLM.from_pretrained(
     MODEL_PATH, low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True
 )
@@ -59,17 +73,17 @@ tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "
 speaker_ids = tts_model.hps.data.spk2id
 speakers = ['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default']
 
-# -------------------- Evaluation Loop --------------------
+# -------------------- SVLA Evaluation Loop --------------------
 all_preds = []
 all_refs = []
 
-for i, sample in enumerate(dataset.select(range(10))):  # demo on 10 samples
+for i, sample in enumerate(multimodal_data[:10]):  # demo on first 10 samples
     # --- image ---
-    image = Image.open(sample["image"]).convert("RGB")
+    image = sample["image"].convert("RGB")
     img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device)
 
     # --- audio ---
-    speech_array, sr = librosa.load(sample["audio"]["path"], sr=16000)
+    speech_array, sr = librosa.load(sample["audio_path"], sr=16000)
     input_values = asr_tokenizer(speech_array, return_tensors="pt", padding="longest").input_values.to(device)
 
     with torch.no_grad():
@@ -78,7 +92,7 @@ for i, sample in enumerate(dataset.select(range(10))):  # demo on 10 samples
     audio_text = asr_tokenizer.decode(predicted_ids[0])
 
     # --- ground truth caption ---
-    reference_caption = sample["captions"][0]["text"]
+    reference_caption = sample["caption"]
 
     # --- format prompt ---
     formatted_prompt = (
@@ -87,6 +101,7 @@ for i, sample in enumerate(dataset.select(range(10))):  # demo on 10 samples
         f"{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n"
         f"{DEFAULT_AUDIO_START_TOKEN}{DEFAULT_AUDIO_TOKEN*128}{DEFAULT_AUDIO_END_TOKEN}\n"
         f"Transcribed speech: {audio_text}\n"
+        f"Image caption: {reference_caption}\n"
         "Describe this image and audio.<|im_end|>\n<|im_start|>assistant\n"
     )
 
