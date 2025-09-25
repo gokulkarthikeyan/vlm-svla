@@ -1,3 +1,7 @@
+# -------------------- Install missing packages --------------------
+!pip install -q evaluate datasets soundfile librosa
+
+# -------------------- Imports --------------------
 import os
 import random
 import torch
@@ -18,18 +22,19 @@ from llava.constants import (
 from melo.api import TTS
 import evaluate
 
-# -------------------- fix for Melo TTS --------------------
+# -------------------- Fix for Melo TTS --------------------
 nltk.download('averaged_perceptron_tagger_eng')
 
-# -------------------- device --------------------
+# -------------------- Device --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# -------------------- load dataset --------------------
-dataset = load_dataset("speechcoco", split="train[:1%]")  # subset for demo
+# -------------------- Load Dataset --------------------
+# Using a small slice for demo (10 samples), expand later if GPU allows
+dataset = load_dataset("speechcoco", split="train[:1%]")
 
-# -------------------- load SVLA model --------------------
-MODEL_PATH = "./weights/svla-sft-text-ins"  # weights must be uploaded
+# -------------------- Load SVLA Model --------------------
+MODEL_PATH = "./weights/svla-sft-text-ins"  # make sure weights are uploaded to this path
 model = LlavaQwen2ForCausalLM.from_pretrained(
     MODEL_PATH, low_cpu_mem_usage=True, device_map="auto", trust_remote_code=True
 )
@@ -38,11 +43,11 @@ vision_tower.load_model(device_map="auto")
 image_processor = vision_tower.image_processor
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
-# -------------------- load ASR model --------------------
+# -------------------- Load ASR Model --------------------
 asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
 asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
 
-# -------------------- metrics --------------------
+# -------------------- Metrics --------------------
 accuracy = evaluate.load("accuracy")
 precision = evaluate.load("precision")
 recall = evaluate.load("recall")
@@ -50,16 +55,16 @@ bleu = evaluate.load("bleu")
 rouge = evaluate.load("rouge")
 meteor = evaluate.load("meteor")
 
-# -------------------- TTS model --------------------
+# -------------------- TTS Model --------------------
 tts_model = TTS(language='EN', device="cuda" if torch.cuda.is_available() else "cpu")
 speaker_ids = tts_model.hps.data.spk2id
 speakers = ['EN-US', 'EN-BR', 'EN_INDIA', 'EN-AU', 'EN-Default']
 
-# -------------------- training/evaluation loop --------------------
+# -------------------- Evaluation Loop --------------------
 all_preds = []
 all_refs = []
 
-for i, sample in enumerate(dataset.select(range(10))):  # just first 10 for demo
+for i, sample in enumerate(dataset.select(range(10))):  # demo on 10 samples
     # --- image ---
     image = Image.open(sample["image"]).convert("RGB")
     img_tensor = image_processor(image, return_tensors="pt")["pixel_values"].to(device)
@@ -107,11 +112,11 @@ for i, sample in enumerate(dataset.select(range(10))):  # just first 10 for demo
     print("Reference Caption:", reference_caption)
     print("Model Response:", response)
 
-    # collect metrics
+    # collect for metrics
     all_preds.append(response)
     all_refs.append(reference_caption)
 
-# -------------------- compute metrics --------------------
+# -------------------- Compute Metrics --------------------
 acc = accuracy.compute(predictions=all_preds, references=all_refs)
 prec = precision.compute(predictions=all_preds, references=all_refs, average="macro")
 rec = recall.compute(predictions=all_preds, references=all_refs, average="macro")
