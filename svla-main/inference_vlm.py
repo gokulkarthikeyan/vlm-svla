@@ -1,73 +1,72 @@
 import argparse
 import torch
 from PIL import Image
-from transformers import AutoTokenizer
 from llava.model import LlavaQwen2ForCausalLM
-from llava.constants import DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IMAGE_TOKEN
-from llava.conversation import conv_templates
-from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
+from melo.api import TTS
+from inference.audio_encoder import audio_encoder
+from inference.tokens_to_audio import decode_speech
+import random
+import librosa
 
-# -------------------------------
-# 1. Argument parser
-# -------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description="SVLA Inference Script")
-    parser.add_argument("--image", type=str, required=True, help="Path to input image")
-    parser.add_argument("--question", type=str, required=True, help="Question for VQA")
-    parser.add_argument("--model-path", type=str, default="./weights/svla-sft-text-ins", help="Path to model weights")
-    return parser.parse_args()
+MODEL_PATH = "./weights/svla-sft-text-ins"
+SPEECH_OUTPUT_PATH = "speech_question.wav"
+ANSWER_SPEECH_PATH = "speech_answer.wav"
+SPEED = 1.0
 
-# -------------------------------
-# 2. Run inference
-# -------------------------------
-def run_inference(image_path, question, model_path):
-    disable_torch_init()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+def load_model(model_path):
     model = LlavaQwen2ForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map="auto"
+        model_path, low_cpu_mem_usage=True, device_map='cuda', trust_remote_code=True
     )
-    image_processor = model.get_vision_tower().image_processor
-    model.eval()
+    model.get_vision_tower().load_model(device_map="cuda:0")
+    return model
+
+def preprocess_image(model, image):
+    # Use SVLA/LLaVA helper to preprocess image
+    image_tensor = model.preprocess_images([image]).to("cuda:0")
+    return image_tensor[0]  # Single image
+
+def generate_answer(model, image_tensor, question, max_tokens=1024):
+    # Prepare prompt
+    system_prompt = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
+    formatted_prompt = f"{system_prompt}\n<|im_start|>user\n<|im_start|>image\n{question}<|im_end|>\n<|im_start|>assistant\n"
+
+    # Tokenize and generate
+    tokenizer = model.get_tokenizer()
+    input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda:0")
+
+    outputs = model.generate(
+        inputs=input_ids,
+        images=image_tensor.unsqueeze(0),
+        max_new_tokens=max_tokens,
+        temperature=0.7,
+        top_p=1.0,
+        repetition_penalty=1.3,
+        do_sample=True
+    )
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", type=str, required=True, help="Path to input image")
+    parser.add_argument("--question", type=str, required=True, help="Question for the VQA model")
+    parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Path to SVLA model weights")
+    args = parser.parse_args()
 
     # Load image
-    image = Image.open(image_path).convert("RGB")
-    image_tensor = process_images([image], image_processor, model.config)
+    image = Image.open(args.image).convert("RGB")
 
-    # Prepare conversation
-    conv = conv_templates["qwen2_vl"].copy()
-    qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + question
-    conv.append_message(conv.roles[0], qs)
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
+    # Load model
+    print("Loading model...")
+    model = load_model(args.model_path)
 
-    # Tokenize & generate
-    input_ids = tokenizer_image_token(
-        prompt,
-        tokenizer,
-        IMAGE_TOKEN_INDEX=tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
-    ).unsqueeze(0).to(model.device)
+    # Preprocess image
+    image_tensor = preprocess_image(model, image)
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor.to(model.device, dtype=torch.float16),
-            max_new_tokens=128,
-            do_sample=True,
-            temperature=0.7,
-        )
+    # Generate answer
+    print(f"Question: {args.question}")
+    answer = generate_answer(model, image_tensor, args.question)
+    print(f"Answer: {answer}")
 
-    answer = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-
-    print(f"Q: {question}")
-    print(f"A: {answer}")
-
-# -------------------------------
-# 3. Main
-# -------------------------------
 if __name__ == "__main__":
-    args = parse_args()
-    run_inference(args.image, args.question, args.model_path)
+    main()
