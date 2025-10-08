@@ -1,174 +1,126 @@
-import torch
-import torchaudio
-from datasets import load_dataset
-from transformers import (
-    AutoProcessor,
-    AutoModelForCTC,
-    TrainingArguments,
-    Trainer,
-)
-import evaluate
-import numpy as np
-import argparse
 import os
+import torch
+import librosa
+import numpy as np
+from PIL import Image
+from llava.model import LlavaQwen2ForCausalLM
+from inference.audio_encoder import audio_encoder
+from melo.api import TTS
+from inference.tokens_to_audio import decode_speech
+from llava.constants import DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IMAGE_TOKEN
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer
+from jiwer import wer, cer  # For metrics
 
-# ====================================================
-# ARGUMENT PARSER
-# ====================================================
-parser = argparse.ArgumentParser(description="ASR Training & Evaluation on LibriSpeech")
-parser.add_argument("--mode", type=str, default="train_asr", choices=["train_asr", "eval_asr", "infer"],
-                    help="Mode: train_asr | eval_asr | infer")
-parser.add_argument("--audio_file", type=str, help="Path to audio file for inference")
-args = parser.parse_args()
+# ----------------- CONFIG -----------------
+MODEL_PATH = "./weights/svla-sft-text-ins"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LIBRISPEECH_PATH = "/kaggle/working/LibriSpeech/train-clean-100"
+SPEECH_OUTPUT_PATH = "speech_question.wav"
+SAMPLE_LIMIT = 20  # Limit number of samples for Kaggle runtime
+IMAGE_PATH = None  # Optional: provide a single image for all samples, e.g., "./image.jpg"
 
-# ====================================================
-# CONFIGURATION
-# ====================================================
-MODEL_NAME = "facebook/wav2vec2-base-960h"
-OUTPUT_DIR = "./asr_librispeech_model"
-CACHE_DIR = "./data"
-
-# ====================================================
-# LOAD DATASET
-# ====================================================
-def load_librispeech_datasets():
-    print("🔹 Loading LibriSpeech dataset...")
-    dataset = load_dataset("librispeech_asr", "clean", cache_dir=CACHE_DIR)
-    train_dataset = dataset["train.clean.100"]
-    test_dataset = dataset["test.clean"]
-    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
-    return train_dataset, test_dataset
-
-# ====================================================
-# PREPARE MODEL & PROCESSOR
-# ====================================================
-def load_model_and_processor():
-    print("🔹 Loading model and processor...")
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = AutoModelForCTC.from_pretrained(MODEL_NAME)
-    return model, processor
-
-# ====================================================
-# PREPROCESS DATA
-# ====================================================
-def prepare_dataset(batch, processor):
-    audio = batch["audio"]
-    batch["input_values"] = processor(audio["array"], sampling_rate=audio["sampling_rate"]).input_values[0]
-    with processor.as_target_processor():
-        batch["labels"] = processor(batch["text"]).input_ids
-    return batch
-
-# ====================================================
-# METRICS (WER + CER)
-# ====================================================
-wer_metric = evaluate.load("wer")
-cer_metric = evaluate.load("cer")
-
-def compute_metrics(pred):
-    pred_logits = pred.predictions
-    pred_ids = np.argmax(pred_logits, axis=-1)
-    pred_str = processor.batch_decode(pred_ids)
-    label_ids = pred.label_ids
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    label_str = processor.batch_decode(label_ids, group_tokens=False)
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    cer = cer_metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer, "cer": cer}
-
-# ====================================================
-# TRAINING FUNCTION
-# ====================================================
-def train_asr_model():
-    train_dataset, test_dataset = load_librispeech_datasets()
-    model, processor = load_model_and_processor()
-
-    print("🔹 Preprocessing data...")
-    train_dataset = train_dataset.map(lambda x: prepare_dataset(x, processor), remove_columns=train_dataset.column_names)
-    test_dataset = test_dataset.map(lambda x: prepare_dataset(x, processor), remove_columns=test_dataset.column_names)
-
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        evaluation_strategy="epoch",
-        learning_rate=3e-4,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=3,
-        save_strategy="epoch",
-        fp16=torch.cuda.is_available(),
-        logging_steps=50,
-        report_to="none",
-    )
-
-    data_collator = lambda data: {
-        "input_values": torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(f["input_values"]) for f in data], batch_first=True, padding_value=0
-        ),
-        "labels": torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(f["labels"]) for f in data], batch_first=True, padding_value=-100
-        ),
-    }
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        tokenizer=processor.feature_extractor,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    print("🔹 Starting training...")
-    trainer.train()
-
-    print("🔹 Evaluating final model...")
-    metrics = trainer.evaluate()
-    print(f"✅ Final Evaluation Results: WER = {metrics['eval_wer']:.3f}, CER = {metrics['eval_cer']:.3f}")
-
-    print("💾 Saving model...")
-    trainer.save_model(OUTPUT_DIR)
-    processor.save_pretrained(OUTPUT_DIR)
-    print(f"✅ Model saved to {OUTPUT_DIR}")
-
-# ====================================================
-# EVALUATION FUNCTION
-# ====================================================
-def evaluate_asr_model():
-    _, test_dataset = load_librispeech_datasets()
-    model, processor = load_model_and_processor()
-    test_dataset = test_dataset.map(lambda x: prepare_dataset(x, processor), remove_columns=test_dataset.column_names)
-
-    trainer = Trainer(model=model, tokenizer=processor.feature_extractor, compute_metrics=compute_metrics)
-    print("🔹 Evaluating model on test set...")
-    metrics = trainer.evaluate(eval_dataset=test_dataset)
-    print(f"✅ Evaluation complete: WER = {metrics['eval_wer']:.3f}, CER = {metrics['eval_cer']:.3f}")
-
-# ====================================================
-# INFERENCE FUNCTION
-# ====================================================
-def infer_single_audio(audio_file):
-    print(f"🔹 Running inference on: {audio_file}")
-    model, processor = load_model_and_processor()
-    model.eval()
-
-    speech_array, sampling_rate = torchaudio.load(audio_file)
-    inputs = processor(speech_array.squeeze(), sampling_rate=sampling_rate, return_tensors="pt")
-
-    with torch.no_grad():
-        logits = model(inputs.input_values).logits
-    pred_ids = torch.argmax(logits, dim=-1)
-    transcription = processor.batch_decode(pred_ids)[0]
-    print(f"✅ Transcription: {transcription}")
-
-# ====================================================
-# MAIN
-# ====================================================
-if args.mode == "train_asr":
-    train_asr_model()
-elif args.mode == "eval_asr":
-    evaluate_asr_model()
-elif args.mode == "infer":
-    if not args.audio_file:
-        print("❌ Please provide an --audio_file for inference.")
+# ----------------- UTILITY FUNCTIONS -----------------
+def resize_image_if_necessary(image, longest_dimension=896):
+    w, h = image.size
+    if w <= longest_dimension and h <= longest_dimension:
+        return image
+    if w > h:
+        new_w = longest_dimension
+        new_h = int((longest_dimension / w) * h)
     else:
-        infer_single_audio(args.audio_file)
+        new_h = longest_dimension
+        new_w = int((longest_dimension / h) * w)
+    return image.resize((new_w, new_h))
+
+def load_model_and_tokenizer(model_path):
+    model = LlavaQwen2ForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, device_map='auto', trust_remote_code=True)
+    vision_tower = model.get_vision_tower()
+    vision_tower.load_model(device_map=DEVICE)
+    tokenizer = model.get_tokenizer()
+    return model, tokenizer, vision_tower.image_processor
+
+def process_image(image_path, image_processor):
+    image = Image.open(image_path)
+    image = resize_image_if_necessary(image)
+    return image_processor(image, return_tensors="pt")["pixel_values"][0].to(DEVICE)
+
+def generate_text(model, tokenizer, image_tensor, prompt, max_new_tokens=256):
+    input_ids = tokenizer([prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to(DEVICE)
+    outputs = model.generate(
+        inputs=input_ids,
+        images=image_tensor.unsqueeze(0) if image_tensor is not None else None,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+# ----------------- SVLA TTS + ASR -----------------
+def svla_speech_asr_pipeline(text, tts_model, speaker_ids, asr_tokenizer, asr_model):
+    # Generate speech from text using SVLA TTS
+    tts_model.tts_to_file(text, speaker_ids["EN-US"], SPEECH_OUTPUT_PATH)
+    # Encode speech to text (audio_encoder)
+    encoded_prompt = audio_encoder(SPEECH_OUTPUT_PATH)
+    
+    # Optional: Decode speech output using Wav2Vec2 ASR
+    audio, sr = librosa.load(SPEECH_OUTPUT_PATH, sr=16000)
+    input_values = asr_tokenizer(audio, return_tensors="pt", padding="longest").input_values.to(DEVICE)
+    logits = asr_model(input_values).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
+    transcription = asr_tokenizer.decode(predicted_ids[0]).upper()
+    return transcription
+
+# ----------------- EVALUATION -----------------
+def evaluate_librispeech_svla(model, tokenizer, image_processor, image_tensor=None):
+    print(f"Evaluating LibriSpeech using SVLA TTS → ASR pipeline...")
+    
+    # Load ASR model
+    asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
+    asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(DEVICE)
+    
+    # Load SVLA TTS
+    tts_model = TTS(language='EN', device=DEVICE)
+    speaker_ids = tts_model.hps.data.spk2id
+
+    all_wers, all_cers = [], []
+    count = 0
+
+    for root, dirs, files in os.walk(LIBRISPEECH_PATH):
+        for file in files:
+            if file.endswith(".txt"):
+                transcript_file = os.path.join(root, file)
+                with open(transcript_file, "r") as f:
+                    ground_truth = f.read().strip().upper()
+
+                # Generate transcription via SVLA TTS → ASR
+                try:
+                    transcription = svla_speech_asr_pipeline(ground_truth, tts_model, speaker_ids, asr_tokenizer, asr_model)
+                except Exception as e:
+                    print(f"Error processing {transcript_file}: {e}")
+                    continue
+
+                all_wers.append(wer(ground_truth, transcription))
+                all_cers.append(cer(ground_truth, transcription))
+
+                count += 1
+                if count >= SAMPLE_LIMIT:
+                    break
+        if count >= SAMPLE_LIMIT:
+            break
+
+    print(f"Evaluated {count} samples")
+    print(f"Average WER: {np.mean(all_wers):.4f}")
+    print(f"Average CER: {np.mean(all_cers):.4f}")
+
+# ----------------- MAIN -----------------
+def main():
+    model, tokenizer, image_processor = load_model_and_tokenizer(MODEL_PATH)
+    
+    if IMAGE_PATH is not None and os.path.exists(IMAGE_PATH):
+        image_tensor = process_image(IMAGE_PATH, image_processor)
+    else:
+        image_tensor = None
+    
+    evaluate_librispeech_svla(model, tokenizer, image_processor, image_tensor)
+
+if __name__ == "__main__":
+    main()
