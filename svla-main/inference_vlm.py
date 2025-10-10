@@ -3,7 +3,8 @@
 # =====================================================
 import os
 import numpy as np
-from datasets import Dataset, Audio
+import librosa
+from datasets import Dataset
 from transformers import (
     Wav2Vec2ForCTC,
     Wav2Vec2Processor,
@@ -46,7 +47,7 @@ def load_librispeech_subset(path, max_files=None):
     return audio_paths[:max_files], texts[:max_files]
 
 # =====================================================
-# LOAD A SMALL SAMPLE OF LIBRISPEECH
+# LOAD AUDIO FILES
 # =====================================================
 audio_files, transcripts = load_librispeech_subset(DATA_DIR, MAX_FILES)
 print(f"✅ Loaded {len(audio_files)} audio files")
@@ -56,7 +57,6 @@ print(f"✅ Loaded {len(audio_files)} audio files")
 # =====================================================
 dataset = Dataset.from_dict({"path": audio_files, "text": transcripts})
 dataset = dataset.train_test_split(test_size=0.2)
-dataset = dataset.cast_column("path", Audio(sampling_rate=SAMPLE_RATE))
 print(dataset)
 
 # =====================================================
@@ -69,13 +69,14 @@ model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
 # FEATURE EXTRACTION FUNCTION
 # =====================================================
 def preprocess(batch):
-    # batch["path"]["array"] is from datasets Audio type
-    batch["input_values"] = processor(batch["path"]["array"], sampling_rate=SAMPLE_RATE).input_values[0]
+    speech_array, _ = librosa.load(batch["path"], sr=SAMPLE_RATE)
+    batch["input_values"] = processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0]
     with processor.as_target_processor():
         batch["labels"] = processor(batch["text"]).input_ids
     return batch
 
-dataset = dataset.map(preprocess, remove_columns=["path"], num_proc=2)
+# Use num_proc=1 to avoid multiprocessing issues with librosa
+dataset = dataset.map(preprocess, remove_columns=["path"], num_proc=1)
 
 # =====================================================
 # METRIC: WORD ERROR RATE (WER)
@@ -88,7 +89,7 @@ def compute_metrics(pred):
     pred_str = processor.batch_decode(pred_ids)
     
     label_ids = pred.label_ids
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id  # handle -100
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
     label_str = processor.batch_decode(label_ids, group_tokens=False)
     
     wer = wer_metric.compute(predictions=pred_str, references=label_str)
