@@ -1,108 +1,127 @@
-from ipywidgets import VBox, HBox, Button, FileUpload, Text, Output, ButtonStyle
-from IPython.display import display, clear_output
-from PIL import Image
-import io
 import torch
-from inference.audio_encoder import audio_encoder  # your existing audio processing
-from inference.tokens_to_audio import decode_speech
-from transformers import AutoTokenizer
-from llava.model import LlavaQwen2ForCausalLM
-from melo.api import TTS
-import random
+from datasets import load_dataset, load_metric
+from transformers import (
+    Wav2Vec2ForCTC, 
+    Wav2Vec2Processor, 
+    TrainingArguments, 
+    Trainer
+)
+import librosa
+import numpy as np
 
-# --- Widgets ---
-question_text = Text(value='', description='Question:', placeholder='Type your question here...')
-image_upload = FileUpload(accept='image/*', description='Upload Image (optional)')
-audio_upload = FileUpload(accept='audio/*', description='Upload Audio (optional)')
-submit_button = Button(description='Submit', button_style='success')
-reset_button = Button(description='Reset', button_style='warning')
-output = Output()
+# ================================
+# CONFIGURATION
+# ================================
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+FP16 = True if DEVICE == "cuda" else False
+SAMPLE_RATE = 16000
+BATCH_SIZE = 2          # Small batch for CPU/GPU
+EPOCHS = 3
+LEARNING_RATE = 1e-4
 
-# --- Model setup (load once) ---
-MODEL_PATH = "./weights/svla-sft-text-ins"
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# ================================
+# LOAD LIBRISPEECH DATASET (subset for Kaggle)
+# ================================
+dataset = load_dataset("librispeech_asr", "clean", split="train.100")
+dataset_test = load_dataset("librispeech_asr", "clean", split="test.clean")
 
-model = LlavaQwen2ForCausalLM.from_pretrained(MODEL_PATH, low_cpu_mem_usage=True, device_map='auto', trust_remote_code=True)
-vision_tower = model.get_vision_tower()
-vision_tower.load_model(device_map="cuda:0")
-image_processor = vision_tower.image_processor
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-text_to_audio_model = TTS(language='EN', device=device)
-speaker_ids = text_to_audio_model.hps.data.spk2id
+# Rename columns to match preprocessing
+dataset = dataset.rename_column("file", "path")
+dataset = dataset.rename_column("text", "text")
+dataset_test = dataset_test.rename_column("file", "path")
+dataset_test = dataset_test.rename_column("text", "text")
 
-# --- Reset button functionality ---
-def on_reset_clicked(b):
-    question_text.value = ''
-    image_upload.value.clear()
-    audio_upload.value.clear()
-    with output:
-        clear_output()
+dataset_dict = {"train": dataset, "test": dataset_test}
 
-reset_button.on_click(on_reset_clicked)
+# ================================
+# LOAD MODEL & PROCESSOR
+# ================================
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+model = Wav2Vec2ForCTC.from_pretrained(
+    "facebook/wav2vec2-base-960h",
+    ctc_loss_reduction="mean",
+    pad_token_id=processor.tokenizer.pad_token_id
+)
+model.to(DEVICE)
 
-# --- Submit button functionality ---
-def on_submit_clicked(b):
-    with output:
-        clear_output()
-        # --- Get text input ---
-        prompt = question_text.value.strip()
-        if not prompt:
-            print("Please type a question.")
-            return
-        
-        # --- Process image if uploaded ---
-        image_tensor = None
-        if image_upload.value:
-            try:
-                uploaded_file = next(iter(image_upload.value.values()))
-                img_data = uploaded_file['content']
-                image = Image.open(io.BytesIO(img_data)).convert('RGB')
-                image = image_processor(image, return_tensors='pt')["pixel_values"][0].to(device)
-                image_tensor = image.unsqueeze(0).float()
-            except Exception as e:
-                print(f"Error processing image: {e}")
-        
-        # --- Process audio if uploaded ---
-        if audio_upload.value:
-            try:
-                uploaded_file = next(iter(audio_upload.value.values()))
-                audio_path = "temp_audio.wav"
-                with open(audio_path, "wb") as f:
-                    f.write(uploaded_file['content'])
-                prompt = audio_encoder(audio_path)  # Convert audio to text prompt
-            except Exception as e:
-                print(f"Error processing audio: {e}")
-        
-        # --- Build final prompt ---
-        system_prompt = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
-        if image_tensor is not None:
-            final_prompt = f"{system_prompt}\n<|im_start|>user\n<image>{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        else:
-            final_prompt = f"{system_prompt}\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+# ================================
+# PREPROCESS FUNCTION
+# ================================
+def preprocess_function(batch):
+    speech_array, _ = librosa.load(batch["path"], sr=SAMPLE_RATE)
+    batch["input_values"] = processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0]
+    batch["labels"] = processor.tokenizer(batch["text"]).input_ids
+    return batch
 
-        # --- Generate response ---
-        try:
-            input_ids = tokenizer([final_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
-            outputs = model.generate(inputs=input_ids, images=image_tensor, max_new_tokens=512, do_sample=True)
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print("Response:\n", generated_text)
-            
-            # --- Optional: convert to speech ---
-            if "||audio-" in generated_text:
-                decode_speech(generated_text, device, "speech_answer.wav")
-                print("Speech saved to 'speech_answer.wav'")
-        except Exception as e:
-            print(f"Error generating text: {e}")
+# Map dataset (num_proc=1 to avoid hanging on Kaggle)
+dataset_dict["train"] = dataset_dict["train"].map(
+    preprocess_function, remove_columns=["path", "text"], num_proc=1
+)
+dataset_dict["test"] = dataset_dict["test"].map(
+    preprocess_function, remove_columns=["path", "text"], num_proc=1
+)
 
-submit_button.on_click(on_submit_clicked)
+# ================================
+# METRICS
+# ================================
+wer_metric = load_metric("wer")
+cer_metric = load_metric("cer")
 
-# --- Display UI ---
-ui = VBox([
-    question_text,
-    image_upload,
-    audio_upload,
-    HBox([submit_button, reset_button]),
-    output
-])
+def compute_metrics(pred):
+    pred_logits = pred.predictions
+    pred_ids = np.argmax(pred_logits, axis=-1)
+    pred_str = processor.batch_decode(pred_ids)
 
-display(ui)
+    label_ids = pred.label_ids
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    label_str = processor.batch_decode(label_ids, group_tokens=False)
+
+    wer = wer_metric.compute(predictions=pred_str, references=label_str)
+    cer = cer_metric.compute(predictions=pred_str, references=label_str)
+
+    total_tokens = 0
+    correct_tokens = 0
+    for p, l in zip(pred_ids, label_ids):
+        mask = l != processor.tokenizer.pad_token_id
+        total_tokens += mask.sum()
+        correct_tokens += ((p == l) & mask).sum()
+    token_acc = correct_tokens / total_tokens
+
+    return {"wer": wer, "cer": cer, "token_accuracy": token_acc}
+
+# ================================
+# TRAINING ARGUMENTS
+# ================================
+training_args = TrainingArguments(
+    output_dir="./svla-finetuned",
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    logging_strategy="steps",
+    logging_steps=10,
+    num_train_epochs=EPOCHS,
+    learning_rate=LEARNING_RATE,
+    save_total_limit=2,
+    fp16=FP16,
+    report_to="none"
+)
+
+# ================================
+# TRAINER
+# ================================
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset_dict["train"],
+    eval_dataset=dataset_dict["test"],
+    tokenizer=processor.feature_extractor,
+    compute_metrics=compute_metrics
+)
+
+# ================================
+# TRAIN & EVALUATE
+# ================================
+trainer.train()
+results = trainer.evaluate()
+print("Evaluation Results:", results)
