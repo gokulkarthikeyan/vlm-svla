@@ -1,68 +1,116 @@
-import torch
 import os
+import torch
 import librosa
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer
-from jiwer import wer, cer
+import numpy as np
+from datasets import load_dataset, load_metric, Dataset, DatasetDict
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, TrainingArguments, Trainer
 
-# ======== Device Setup ========
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+# =====================================================
+# CONFIGURATION
+# =====================================================
+LIBRISPEECH_PATH = "/kaggle/input/librispeeech/LibriSpeech"  # Path in your Kaggle dataset
+MODEL_NAME = "facebook/wav2vec2-base-960h"
+SAMPLE_RATE = 16000
 
-# ======== ASR Evaluation Function ========
-def evaluate_librispeech(asr_model, asr_tokenizer, dataset_path):
-    total_wer = 0.0
-    total_cer = 0.0
-    count = 0
-    print(f"Starting evaluation on dataset: {dataset_path}")
+# =====================================================
+# LOAD DATASET (LOCAL)
+# =====================================================
+# You can load only a subset for speed (train-clean-100)
+def get_audio_files(path):
+    audio_files = []
+    texts = []
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            if file.endswith(".flac"):
+                transcript_file = os.path.join(root, file.replace(".flac", ".txt"))
+                if os.path.exists(transcript_file):
+                    audio_files.append(os.path.join(root, file))
+                    with open(transcript_file, "r", encoding="utf-8") as f:
+                        line = f.readline().strip()
+                        # Example format: "84-121123-0000 THE TRANSCRIPTION"
+                        texts.append(" ".join(line.split(" ")[1:]))
+    return audio_files, texts
 
-    for root, _, files in os.walk(dataset_path):
-        for f in files:
-            if f.endswith(".flac"):
-                audio_path = os.path.join(root, f)
-                label_path = audio_path.replace(".flac", ".txt")
-                if not os.path.exists(label_path):
-                    continue
-                with open(label_path, 'r') as lf:
-                    true_text = lf.read().strip().lower()
-                
-                audio, sr = librosa.load(audio_path, sr=16000)
-                input_values = asr_tokenizer(audio, return_tensors="pt", padding="longest").input_values.to(device)
-                
-                with torch.no_grad():
-                    logits = asr_model(input_values).logits
-                predicted_ids = torch.argmax(logits, dim=-1)
-                transcription = asr_tokenizer.decode(predicted_ids[0]).lower()
-                
-                total_wer += wer(true_text, transcription)
-                total_cer += cer(true_text, transcription)
-                count += 1
+audio_files, texts = get_audio_files(LIBRISPEECH_PATH)
+print(f"Loaded {len(audio_files)} audio files")
 
-                if count % 10 == 0:
-                    print(f"Processed {count} samples... Current WER: {total_wer/count:.4f}, CER: {total_cer/count:.4f}")
+# Use only a smaller subset for training quickly
+audio_files = audio_files[:200]
+texts = texts[:200]
 
-    if count > 0:
-        print(f"\nFinal evaluation on {dataset_path}: WER = {total_wer/count:.4f}, CER = {total_cer/count:.4f}\n")
-    else:
-        print("No valid audio files found in dataset.")
+# =====================================================
+# CREATE HUGGINGFACE DATASET
+# =====================================================
+data = Dataset.from_dict({"path": audio_files, "text": texts})
+data = data.train_test_split(test_size=0.2)
+print(data)
 
-# ======== Main Function ========
-def main():
-    print("Starting automatic LibriSpeech evaluation (hands-free)...\n")
-    
-    print("Loading pretrained ASR model...")
-    asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
-    asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
-    asr_model.eval()
+# =====================================================
+# LOAD PROCESSOR AND MODEL
+# =====================================================
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
 
-    train_path = "/kaggle/working/LibriSpeech/train-clean-100"
-    test_path = "/kaggle/working/LibriSpeech/test-clean"
+# =====================================================
+# PREPROCESS FUNCTION
+# =====================================================
+def speech_file_to_array_fn(batch):
+    speech_array, sampling_rate = librosa.load(batch["path"], sr=SAMPLE_RATE)
+    batch["speech"] = speech_array
+    batch["sampling_rate"] = sampling_rate
+    batch["input_values"] = processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0]
+    with processor.as_target_processor():
+        batch["labels"] = processor(batch["text"]).input_ids
+    return batch
 
-    print("\nEvaluating train-clean-100...")
-    evaluate_librispeech(asr_model, asr_tokenizer, train_path)
+data = data.map(speech_file_to_array_fn, remove_columns=["path"])
 
-    print("\nEvaluating test-clean...")
-    evaluate_librispeech(asr_model, asr_tokenizer, test_path)
+# =====================================================
+# TRAINING ARGUMENTS
+# =====================================================
+training_args = TrainingArguments(
+    output_dir="./results",
+    evaluation_strategy="epoch",
+    learning_rate=1e-4,
+    per_device_train_batch_size=4,
+    num_train_epochs=1,
+    save_total_limit=1,
+    fp16=True,
+    logging_dir="./logs",
+)
 
-    print("LibriSpeech evaluation completed!")
+# =====================================================
+# METRICS
+# =====================================================
+wer_metric = load_metric("wer")
 
-if __name__ == "__main__":
-    main()
+def compute_metrics(pred):
+    pred_logits = pred.predictions
+    pred_ids = np.argmax(pred_logits, axis=-1)
+    pred_str = processor.batch_decode(pred_ids)
+    label_str = processor.batch_decode(pred.label_ids, group_tokens=False)
+    wer = wer_metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+# =====================================================
+# TRAINER
+# =====================================================
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=data["train"],
+    eval_dataset=data["test"],
+    tokenizer=processor.feature_extractor,
+    compute_metrics=compute_metrics,
+)
+
+# =====================================================
+# TRAIN MODEL
+# =====================================================
+trainer.train()
+
+# =====================================================
+# EVALUATE
+# =====================================================
+metrics = trainer.evaluate()
+print(metrics)
