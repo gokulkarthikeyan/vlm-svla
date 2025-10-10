@@ -7,43 +7,42 @@ from sklearn.model_selection import train_test_split
 import librosa
 import numpy as np
 import torch
-from datasets import load_dataset, load_metric
-from transformers import (
-    Wav2Vec2ForCTC,
-    Wav2Vec2Processor,
-    TrainingArguments,
-    Trainer
-)
+from datasets import load_dataset
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, TrainingArguments, Trainer
+import evaluate
+from tqdm import tqdm
 
 # ================================
 # CONFIGURATION
 # ================================
-DATASET_PATH = "/kaggle/input/librispeech"  # your uploaded dataset path
+DATASET_PATH = "/kaggle/input/librispeech/LibriSpeech/train-clean-100"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FP16 = True if DEVICE == "cuda" else False
 SAMPLE_RATE = 16000
-BATCH_SIZE = 2          # adjust for CPU/GPU
+BATCH_SIZE = 2          # adjust for CPU/GPU memory
 EPOCHS = 3
 LEARNING_RATE = 1e-4
 
 # ================================
-# STEP 1: LOAD FILES AND CREATE CSV
+# STEP 1: LOAD FILES AND TRANSCRIPTS
 # ================================
-# Assuming filenames like: HELLO_WORLD_001.wav
-audio_files = [f for f in os.listdir(DATASET_PATH) if f.endswith(".wav")]
-
 data = []
-for f in audio_files:
-    text = os.path.splitext(f)[0].replace("_", " ")  # Extract text from filename
-    path = os.path.join(DATASET_PATH, f)
-    data.append({"path": path, "text": text})
+for root, dirs, files in os.walk(DATASET_PATH):
+    txt_files = [f for f in files if f.endswith(".txt")]
+    for txt_file in txt_files:
+        txt_path = os.path.join(root, txt_file)
+        with open(txt_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for line in lines:
+            audio_id, transcript = line.strip().split(" ", 1)
+            audio_file = os.path.join(root, audio_id + ".flac")
+            if os.path.exists(audio_file):
+                data.append({"path": audio_file, "text": transcript.lower()})
 
 df = pd.DataFrame(data)
-
-# Split into 80% train, 20% test
 train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
 
-# Save CSVs for use with datasets library
+# Save CSVs for HuggingFace dataset loading
 train_csv = "/kaggle/working/train.csv"
 test_csv = "/kaggle/working/test.csv"
 train_df.to_csv(train_csv, index=False)
@@ -75,15 +74,20 @@ def preprocess_function(batch):
     batch["labels"] = processor.tokenizer(batch["text"]).input_ids
     return batch
 
-# Map datasets (use num_proc=1 to avoid hanging)
-dataset["train"] = dataset["train"].map(preprocess_function, remove_columns=["path", "text"], num_proc=1)
-dataset["test"] = dataset["test"].map(preprocess_function, remove_columns=["path", "text"], num_proc=1)
+# Use tqdm for progress bar
+for split in ["train", "test"]:
+    dataset[split] = dataset[split].map(
+        preprocess_function,
+        remove_columns=["path","text"],
+        num_proc=1,
+        desc=f"Preprocessing {split}"
+    )
 
 # ================================
 # STEP 5: METRICS
 # ================================
-wer_metric = load_metric("wer")
-cer_metric = load_metric("cer")
+wer_metric = evaluate.load("wer")
+cer_metric = evaluate.load("cer")
 
 def compute_metrics(pred):
     pred_logits = pred.predictions
@@ -97,6 +101,7 @@ def compute_metrics(pred):
     wer = wer_metric.compute(predictions=pred_str, references=label_str)
     cer = cer_metric.compute(predictions=pred_str, references=label_str)
 
+    # Token accuracy
     total_tokens = 0
     correct_tokens = 0
     for p, l in zip(pred_ids, label_ids):
