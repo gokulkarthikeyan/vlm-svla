@@ -16,6 +16,7 @@ from tqdm import tqdm
 # CONFIGURATION
 # ================================
 DATASET_PATH = "/kaggle/input/librispeech/LibriSpeech/train-clean-100"
+BOOKS_TXT = "/kaggle/input/librispeech/LibriSpeech/BOOKS.TXT"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FP16 = True if DEVICE == "cuda" else False
 SAMPLE_RATE = 16000
@@ -24,30 +25,42 @@ EPOCHS = 3
 LEARNING_RATE = 1e-4
 
 # ================================
-# STEP 1: LOAD FILES AND TRANSCRIPTS
+# STEP 1: LOAD AUDIO AND TRANSCRIPTS
 # ================================
 data = []
+
+# Load transcripts from BOOKS.TXT
+book_map = {}
+if os.path.exists(BOOKS_TXT):
+    with open(BOOKS_TXT, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2:
+                book_map[parts[0]] = parts[1].lower()
+
+# Recursively scan .flac files
 for root, dirs, files in os.walk(DATASET_PATH):
-    txt_files = [f for f in files if f.endswith(".txt")]
-    for txt_file in txt_files:
-        txt_path = os.path.join(root, txt_file)
-        with open(txt_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for line in lines:
-            audio_id, transcript = line.strip().split(" ", 1)
-            audio_file = os.path.join(root, audio_id + ".flac")
-            if os.path.exists(audio_file):
-                data.append({"path": audio_file, "text": transcript.lower()})
+    for f in files:
+        if f.endswith(".flac"):
+            path = os.path.join(root, f)
+            audio_id = os.path.splitext(f)[0]
+            # Only include if transcript exists in BOOKS.TXT
+            if audio_id in book_map:
+                text = book_map[audio_id]
+                data.append({"path": path, "text": text})
 
+print("Total audio samples with valid transcript:", len(data))
 df = pd.DataFrame(data)
-train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
 
-# Save CSVs for HuggingFace dataset loading
+# Split into train/test
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
+
+# Save CSVs for HuggingFace dataset
 train_csv = "/kaggle/working/train.csv"
 test_csv = "/kaggle/working/test.csv"
 train_df.to_csv(train_csv, index=False)
 test_df.to_csv(test_csv, index=False)
-print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
 
 # ================================
 # STEP 2: LOAD DATASET
@@ -74,7 +87,7 @@ def preprocess_function(batch):
     batch["labels"] = processor.tokenizer(batch["text"]).input_ids
     return batch
 
-# Use tqdm for progress bar
+# Apply preprocessing with progress bar
 for split in ["train", "test"]:
     dataset[split] = dataset[split].map(
         preprocess_function,
