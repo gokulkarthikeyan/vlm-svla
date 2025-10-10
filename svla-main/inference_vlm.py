@@ -44,12 +44,17 @@ for root, dirs, files in os.walk(DATASET_PATH):
         if f.endswith(".flac"):
             path = os.path.join(root, f)
             audio_id = os.path.splitext(f)[0]
-            # Only include if transcript exists in BOOKS.TXT
-            if audio_id in book_map:
-                text = book_map[audio_id]
-                data.append({"path": path, "text": text})
+            # Use BOOKS.TXT transcript if exists, else fallback to filename
+            text = book_map.get(audio_id, audio_id.replace("_", " ").lower())
+            data.append({"path": path, "text": text})
 
-print("Total audio samples with valid transcript:", len(data))
+# Check if dataset is empty
+if len(data) == 0:
+    raise ValueError(
+        "No audio files found! Check DATASET_PATH and BOOKS.TXT."
+    )
+
+print("Total audio samples found:", len(data))
 df = pd.DataFrame(data)
 
 # Split into train/test
