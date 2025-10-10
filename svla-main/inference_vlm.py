@@ -1,40 +1,62 @@
+# ================================
+# IMPORTS
+# ================================
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import librosa
+import numpy as np
 import torch
 from datasets import load_dataset, load_metric
 from transformers import (
-    Wav2Vec2ForCTC, 
-    Wav2Vec2Processor, 
-    TrainingArguments, 
+    Wav2Vec2ForCTC,
+    Wav2Vec2Processor,
+    TrainingArguments,
     Trainer
 )
-import librosa
-import numpy as np
 
 # ================================
 # CONFIGURATION
 # ================================
+DATASET_PATH = "/kaggle/input/librispeech"  # your uploaded dataset path
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 FP16 = True if DEVICE == "cuda" else False
 SAMPLE_RATE = 16000
-BATCH_SIZE = 2          # Small batch for CPU/GPU
+BATCH_SIZE = 2          # adjust for CPU/GPU
 EPOCHS = 3
 LEARNING_RATE = 1e-4
 
 # ================================
-# LOAD LIBRISPEECH DATASET (subset for Kaggle)
+# STEP 1: LOAD FILES AND CREATE CSV
 # ================================
-dataset = load_dataset("librispeech_asr", "clean", split="train.100")
-dataset_test = load_dataset("librispeech_asr", "clean", split="test.clean")
+# Assuming filenames like: HELLO_WORLD_001.wav
+audio_files = [f for f in os.listdir(DATASET_PATH) if f.endswith(".wav")]
 
-# Rename columns to match preprocessing
-dataset = dataset.rename_column("file", "path")
-dataset = dataset.rename_column("text", "text")
-dataset_test = dataset_test.rename_column("file", "path")
-dataset_test = dataset_test.rename_column("text", "text")
+data = []
+for f in audio_files:
+    text = os.path.splitext(f)[0].replace("_", " ")  # Extract text from filename
+    path = os.path.join(DATASET_PATH, f)
+    data.append({"path": path, "text": text})
 
-dataset_dict = {"train": dataset, "test": dataset_test}
+df = pd.DataFrame(data)
+
+# Split into 80% train, 20% test
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+# Save CSVs for use with datasets library
+train_csv = "/kaggle/working/train.csv"
+test_csv = "/kaggle/working/test.csv"
+train_df.to_csv(train_csv, index=False)
+test_df.to_csv(test_csv, index=False)
+print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
 
 # ================================
-# LOAD MODEL & PROCESSOR
+# STEP 2: LOAD DATASET
+# ================================
+dataset = load_dataset("csv", data_files={"train": train_csv, "test": test_csv})
+
+# ================================
+# STEP 3: LOAD MODEL & PROCESSOR
 # ================================
 processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
 model = Wav2Vec2ForCTC.from_pretrained(
@@ -45,7 +67,7 @@ model = Wav2Vec2ForCTC.from_pretrained(
 model.to(DEVICE)
 
 # ================================
-# PREPROCESS FUNCTION
+# STEP 4: PREPROCESSING FUNCTION
 # ================================
 def preprocess_function(batch):
     speech_array, _ = librosa.load(batch["path"], sr=SAMPLE_RATE)
@@ -53,16 +75,12 @@ def preprocess_function(batch):
     batch["labels"] = processor.tokenizer(batch["text"]).input_ids
     return batch
 
-# Map dataset (num_proc=1 to avoid hanging on Kaggle)
-dataset_dict["train"] = dataset_dict["train"].map(
-    preprocess_function, remove_columns=["path", "text"], num_proc=1
-)
-dataset_dict["test"] = dataset_dict["test"].map(
-    preprocess_function, remove_columns=["path", "text"], num_proc=1
-)
+# Map datasets (use num_proc=1 to avoid hanging)
+dataset["train"] = dataset["train"].map(preprocess_function, remove_columns=["path", "text"], num_proc=1)
+dataset["test"] = dataset["test"].map(preprocess_function, remove_columns=["path", "text"], num_proc=1)
 
 # ================================
-# METRICS
+# STEP 5: METRICS
 # ================================
 wer_metric = load_metric("wer")
 cer_metric = load_metric("cer")
@@ -90,7 +108,7 @@ def compute_metrics(pred):
     return {"wer": wer, "cer": cer, "token_accuracy": token_acc}
 
 # ================================
-# TRAINING ARGUMENTS
+# STEP 6: TRAINING ARGUMENTS
 # ================================
 training_args = TrainingArguments(
     output_dir="./svla-finetuned",
@@ -108,19 +126,19 @@ training_args = TrainingArguments(
 )
 
 # ================================
-# TRAINER
+# STEP 7: TRAINER
 # ================================
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=dataset_dict["train"],
-    eval_dataset=dataset_dict["test"],
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
     tokenizer=processor.feature_extractor,
     compute_metrics=compute_metrics
 )
 
 # ================================
-# TRAIN & EVALUATE
+# STEP 8: TRAIN & EVALUATE
 # ================================
 trainer.train()
 results = trainer.evaluate()
