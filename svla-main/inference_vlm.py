@@ -4,7 +4,7 @@
 import os
 import numpy as np
 import librosa
-from datasets import Dataset
+from datasets import Dataset, logging as hf_logging
 from transformers import (
     Wav2Vec2ForCTC,
     Wav2Vec2Processor,
@@ -12,6 +12,11 @@ from transformers import (
     Trainer
 )
 import evaluate
+
+# =====================================================
+# SUPPRESS DATASET WARNINGS FOR CLEAN OUTPUT
+# =====================================================
+hf_logging.set_verbosity_error()
 
 # =====================================================
 # CONFIGURATION
@@ -66,17 +71,38 @@ processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
 model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
 
 # =====================================================
-# FEATURE EXTRACTION FUNCTION
+# FEATURE EXTRACTION FUNCTION (batched + multi-core)
 # =====================================================
 def preprocess(batch):
-    speech_array, _ = librosa.load(batch["path"], sr=SAMPLE_RATE)
-    batch["input_values"] = processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0]
-    with processor.as_target_processor():
-        batch["labels"] = processor(batch["text"]).input_ids
+    input_values = []
+    labels = []
+
+    for path, text in zip(batch["path"], batch["text"]):
+        # Load audio
+        speech_array, _ = librosa.load(path, sr=SAMPLE_RATE)
+        
+        # Convert audio to input_values for Wav2Vec2
+        input_values.append(processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0])
+        
+        # Convert text to labels
+        with processor.as_target_processor():
+            labels.append(processor(text).input_ids)
+
+    batch["input_values"] = input_values
+    batch["labels"] = labels
     return batch
 
-# Use num_proc=1 to avoid multiprocessing issues with librosa
-dataset = dataset.map(preprocess, remove_columns=["path"], num_proc=1)
+# =====================================================
+# APPLY PREPROCESSING USING MULTI-CORE + BATCHING
+# =====================================================
+dataset = dataset.map(
+    preprocess,
+    remove_columns=["path"],  # remove file paths
+    batched=True,             # process multiple examples at once
+    batch_size=4,             # adjust based on Kaggle memory
+    num_proc=4                # parallel processing
+)
+print("✅ Preprocessing complete!")
 
 # =====================================================
 # METRIC: WORD ERROR RATE (WER)
