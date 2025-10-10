@@ -1,160 +1,156 @@
 # =====================================================
 # IMPORTS
 # =====================================================
-import os
-import numpy as np
+import torch
+from PIL import Image
 import librosa
-from datasets import Dataset, logging as hf_logging
-from transformers import (
-    Wav2Vec2ForCTC,
-    Wav2Vec2Processor,
-    TrainingArguments,
-    Trainer
-)
-import evaluate
+from pathlib import Path
+import ipywidgets as widgets
+from IPython.display import display
+import random
+import os
 
-# =====================================================
-# SUPPRESS DATASET WARNINGS FOR CLEAN OUTPUT
-# =====================================================
-hf_logging.set_verbosity_error()
+# Your model imports
+from transformers import AutoTokenizer
+from llava.model import LlavaQwen2ForCausalLM
+from melo.api import TTS
+from inference.audio_encoder import audio_encoder
+from inference.tokens_to_audio import decode_speech
+from llava.constants import (DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN,
+                             DEFAULT_IM_END_TOKEN, DEFAULT_AUDIO_TOKEN,
+                             DEFAULT_AUDIO_START_TOKEN, DEFAULT_AUDIO_END_TOKEN)
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
-DATA_DIR = "/kaggle/input/librispeeech/LibriSpeech/train-clean-100"
-MODEL_NAME = "facebook/wav2vec2-base-960h"
+MODEL_PATH = "./weights/svla-sft-text-ins"
+UPLOAD_DIR = Path("/kaggle/working/uploaded_files")
+UPLOAD_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 16000
-MAX_FILES = 200  # small subset for Kaggle
+speed = 1.0
 
 # =====================================================
-# HELPER FUNCTION TO LOAD AUDIO + TRANSCRIPTS
+# UTILITY FUNCTIONS
 # =====================================================
-def load_librispeech_subset(path, max_files=None):
-    audio_paths = []
-    texts = []
+def upload_file_widget(accept, description="Upload"):
+    uploader = widgets.FileUpload(accept=accept, multiple=False, description=description)
+    display(uploader)
+    return uploader
 
-    for root, _, files in os.walk(path):
-        transcript_files = [f for f in files if f.endswith(".trans.txt")]
-        for tf in transcript_files:
-            with open(os.path.join(root, tf), "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split(" ", 1)
-                    if len(parts) == 2:
-                        audio_file = os.path.join(root, parts[0] + ".flac")
-                        if os.path.exists(audio_file):
-                            audio_paths.append(audio_file)
-                            texts.append(parts[1])
-                    if max_files and len(audio_paths) >= max_files:
-                        break
-        if max_files and len(audio_paths) >= max_files:
-            break
+def save_uploaded_file(uploader, save_dir=UPLOAD_DIR):
+    if not uploader.value:
+        return None
+    uploaded_file = list(uploader.value.values())[0]
+    file_path = save_dir / uploaded_file['metadata']['name']
+    with open(file_path, 'wb') as f:
+        f.write(uploaded_file['content'])
+    return file_path
 
-    return audio_paths[:max_files], texts[:max_files]
+def load_image(path):
+    try:
+        return Image.open(path)
+    except:
+        return None
 
-# =====================================================
-# LOAD AUDIO FILES
-# =====================================================
-audio_files, transcripts = load_librispeech_subset(DATA_DIR, MAX_FILES)
-print(f"✅ Loaded {len(audio_files)} audio files")
+def load_audio(path, sr=SAMPLE_RATE):
+    try:
+        audio, _ = librosa.load(path, sr=sr)
+        return audio
+    except:
+        return None
 
-# =====================================================
-# CREATE DATASET AND SPLIT
-# =====================================================
-dataset = Dataset.from_dict({"path": audio_files, "text": transcripts})
-dataset = dataset.train_test_split(test_size=0.2)
-print(dataset)
-
-# =====================================================
-# LOAD MODEL AND PROCESSOR
-# =====================================================
-processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
-model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
+def resize_image_if_necessary(image, longest_dimension=896):
+    original_width, original_height = image.size
+    if original_width <= longest_dimension and original_height <= longest_dimension:
+        return image
+    if original_width > original_height:
+        new_width = longest_dimension
+        new_height = int((longest_dimension / original_width) * original_height)
+    else:
+        new_height = longest_dimension
+        new_width = int((longest_dimension / original_height) * original_width)
+    return image.resize((new_width, new_height))
 
 # =====================================================
-# FEATURE EXTRACTION FUNCTION (batched + multi-core)
+# LOAD MODEL & TOKENIZER
 # =====================================================
-def preprocess(batch):
-    input_values = []
-    labels = []
+print("Loading model, tokenizer, and TTS...")
+model = LlavaQwen2ForCausalLM.from_pretrained(MODEL_PATH, low_cpu_mem_usage=True, device_map='cuda', trust_remote_code=True)
+vision_tower = model.get_vision_tower()
+vision_tower.load_model(device_map="cuda:0")
+image_processor = vision_tower.image_processor
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+text_to_audio_model = TTS(language='EN', device="cuda:1")
+speaker_ids = text_to_audio_model.hps.data.spk2id
+asr_tokenizer = torch.hub.load('pytorch/fairseq', 'wav2vec2_large_lv60k')  # or your preferred tokenizer
+asr_model = torch.hub.load('pytorch/fairseq', 'wav2vec2_large_lv60k')      # or your preferred ASR model
 
-    for path, text in zip(batch["path"], batch["text"]):
-        # Load audio
-        speech_array, _ = librosa.load(path, sr=SAMPLE_RATE)
-        
-        # Convert audio to input_values for Wav2Vec2
-        input_values.append(processor(speech_array, sampling_rate=SAMPLE_RATE).input_values[0])
-        
-        # Convert text to labels
-        with processor.as_target_processor():
-            labels.append(processor(text).input_ids)
-
-    batch["input_values"] = input_values
-    batch["labels"] = labels
-    return batch
+print("✅ Models loaded successfully!\n")
 
 # =====================================================
-# APPLY PREPROCESSING USING MULTI-CORE + BATCHING
+# INTERACTIVE INPUT WIDGETS
 # =====================================================
-dataset = dataset.map(
-    preprocess,
-    remove_columns=["path"],  # remove file paths
-    batched=True,             # process multiple examples at once
-    batch_size=4,             # adjust based on Kaggle memory
-    num_proc=4                # parallel processing
+print("Step 1️⃣: Upload an image (optional)")
+image_uploader = upload_file_widget(accept=".png,.jpg,.jpeg")
+image_path = save_uploaded_file(image_uploader)
+image = resize_image_if_necessary(load_image(image_path)) if image_path else None
+
+print("Step 2️⃣: Upload an audio file (optional)")
+audio_uploader = upload_file_widget(accept=".wav,.flac")
+audio_path = save_uploaded_file(audio_uploader)
+audio = load_audio(audio_path) if audio_path else None
+
+question_widget = widgets.Text(
+    value='',
+    placeholder='Type your question here...',
+    description='Question:',
+    disabled=False
 )
-print("✅ Preprocessing complete!")
+display(question_widget)
 
 # =====================================================
-# METRIC: WORD ERROR RATE (WER)
+# PROCESS INPUT AND GENERATE ANSWER
 # =====================================================
-wer_metric = evaluate.load("wer")
-
-def compute_metrics(pred):
-    pred_logits = pred.predictions
-    pred_ids = np.argmax(pred_logits, axis=-1)
-    pred_str = processor.batch_decode(pred_ids)
+def generate_vqa_answer(change):
+    question = change['new']
+    if not question.strip():
+        print("❌ Empty question, type again!")
+        return
     
-    label_ids = pred.label_ids
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    label_str = processor.batch_decode(label_ids, group_tokens=False)
+    print("\nProcessing your input...\n")
     
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
+    processed_image = None
+    if image is not None:
+        processed_image = image_processor(image, return_tensors='pt')["pixel_values"][0].unsqueeze(0).to("cuda:0")
+    
+    # Handle audio input
+    if audio is not None:
+        # Convert audio to prompt via your audio_encoder
+        speech_prompt = audio_encoder(audio_path)
+        final_prompt = f"{speech_prompt} {question}"
+    else:
+        final_prompt = question
 
-# =====================================================
-# TRAINING ARGUMENTS
-# =====================================================
-training_args = TrainingArguments(
-    output_dir="./results",
-    eval_strategy="epoch",
-    save_strategy="no",
-    learning_rate=1e-4,
-    per_device_train_batch_size=4,
-    num_train_epochs=1,
-    fp16=True,
-    logging_dir="./logs",
-    report_to="none"
-)
-
-# =====================================================
-# TRAINER SETUP
-# =====================================================
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset["train"],
-    eval_dataset=dataset["test"],
-    tokenizer=processor,
-    compute_metrics=compute_metrics
-)
-
-# =====================================================
-# TRAIN MODEL
-# =====================================================
-trainer.train()
-
-# =====================================================
-# EVALUATE ON TEST SET
-# =====================================================
-metrics = trainer.evaluate()
-print("✅ Final Evaluation Metrics:", metrics)
+    # Format prompt for model
+    system_prompt = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
+    if processed_image is not None:
+        formatted_prompt = f"{system_prompt}\n<|im_start|>user\n{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n{final_prompt}<|im_end|>\n<|im_start|>assistant\n"
+    else:
+        formatted_prompt = f"{system_prompt}\n<|im_start|>user\n{final_prompt}<|im_end|>\n<|im_start|>assistant\n"
+    
+    # Generate text answer
+    input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to("cuda:0")
+    outputs = model.generate(inputs=input_ids, images=processed_image, max_new_tokens=1024)
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    print("************************************************* INPUT *************************************************")
+    print(formatted_prompt)
+    print("\n************************************************* OUTPUT *************************************************")
+    print(answer)
+    
+    # Optional: TTS output
+    if "||audio-" in answer:
+        decode_speech(answer.replace(".", ""), "cuda:0", "speech_answer.wav")
+        print("Saved speech answer to 'speech_answer.wav'")
+    
+question_widget.observe(generate_vqa_answer, names='value')
