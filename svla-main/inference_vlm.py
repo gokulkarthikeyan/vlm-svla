@@ -1,135 +1,115 @@
-# =====================================================
-# IMPORTS
-# =====================================================
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from PIL import Image
+import io
 import os
 import torch
-from PIL import Image
-from io import BytesIO
-from ipywidgets import FileUpload, Text, Button, VBox, HBox, Layout
-from IPython.display import display, Audio, clear_output
+import random
 import librosa
-import numpy as np
+
+# ----------------------------
+# 1️⃣ Load your models
+# ----------------------------
+from inference.audio_encoder import audio_encoder
+from llava.model import LlavaQwen2ForCausalLM
 from melo.api import TTS
-from inference.audio_encoder import audio_encoder  # Your speech-to-text function
+from transformers import AutoTokenizer
 from llava.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-# =====================================================
-# CONFIGURATION
-# =====================================================
-MODEL_PATH = "./weights/svla-sft-text-ins"  # Path to your SVLA model
-SAMPLE_RATE = 16000
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-speech_output_path = "speech_answer.wav"
+MODEL_PATH = "./weights/svla-sft-text-ins"
 
-# =====================================================
-# LOAD MODELS
-# =====================================================
-from llava.model import LlavaQwen2ForCausalLM
-from transformers import AutoTokenizer
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = LlavaQwen2ForCausalLM.from_pretrained(MODEL_PATH, low_cpu_mem_usage=True, device_map=device, trust_remote_code=True)
+vision_tower = model.get_vision_tower()
+vision_tower.load_model(device_map=device)
+image_processor = vision_tower.image_processor
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
-def load_svla_model(model_path):
-    model = LlavaQwen2ForCausalLM.from_pretrained(model_path, device_map="cuda", low_cpu_mem_usage=True, trust_remote_code=True)
-    vision_tower = model.get_vision_tower()
-    vision_tower.load_model(device_map="cuda")
-    image_processor = vision_tower.image_processor
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    return model, tokenizer, image_processor
+text_to_audio_model = TTS(language='EN', device=device)
+speaker_ids = text_to_audio_model.hps.data.spk2id
 
-model, tokenizer, image_processor = load_svla_model(MODEL_PATH)
-tts_model = TTS(language="EN", device=DEVICE)
+# ASR model (optional)
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer
+asr_tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-large-960h")
+asr_model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-large-960h").to(device)
 
-# =====================================================
-# HELPER FUNCTIONS
-# =====================================================
-uploaded_image = None
-uploaded_prompt = None
+# ----------------------------
+# 2️⃣ Create Widgets
+# ----------------------------
+image_upload = widgets.FileUpload(accept='image/*', multiple=False, description="Upload Image (optional)")
+audio_upload = widgets.FileUpload(accept='audio/*', multiple=False, description="Upload Audio (optional)")
+text_input = widgets.Text(placeholder='Type your question here...', description='Question:')
+submit_button = widgets.Button(description="Submit", button_style='success')
+reset_button = widgets.Button(description="Reset", button_style='warning')
+output_log = widgets.Output()
 
-def resize_image_if_needed(image: Image.Image, longest_dim=896):
-    w, h = image.size
-    if w <= longest_dim and h <= longest_dim:
-        return image
-    if w > h:
-        new_w = longest_dim
-        new_h = int(longest_dim / w * h)
-    else:
-        new_h = longest_dim
-        new_w = int(longest_dim / h * w)
-    return image.resize((new_w, new_h))
+# ----------------------------
+# 3️⃣ Define Button Callbacks
+# ----------------------------
+def on_submit(btn):
+    with output_log:
+        clear_output()
+        print("Processing your input...")
 
-def handle_image_upload(change):
-    clear_output(wait=True)
-    uploaded_file = image_upload.value
-    if uploaded_file:
-        for fname, file_info in uploaded_file.items():
-            img = Image.open(BytesIO(file_info["content"]))
-            img = resize_image_if_needed(img)
-            display(img)
-            global uploaded_image
-            uploaded_image = img
-    display(ui)
+        # Handle Image
+        if image_upload.value:
+            image_data = list(image_upload.value.values())[0]['content']
+            image = Image.open(io.BytesIO(image_data))
+            display(image)
+            image_tensor = image_processor(image, return_tensors="pt")["pixel_values"][0].to(device)
+        else:
+            image_tensor = None
+            print("No image uploaded.")
 
-def handle_audio_upload(change):
-    clear_output(wait=True)
-    uploaded_file = audio_upload.value
-    if uploaded_file:
-        for fname, file_info in uploaded_file.items():
-            with open("speech_question.wav", "wb") as f:
-                f.write(file_info["content"])
-            transcription = audio_encoder("speech_question.wav")
-            print("Transcribed Audio:", transcription)
-            global uploaded_prompt
-            uploaded_prompt = transcription
-    display(ui)
+        # Handle Audio
+        if audio_upload.value:
+            audio_data = list(audio_upload.value.values())[0]['content']
+            audio_path = "uploaded_audio.wav"
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
+            print(f"Audio saved as {audio_path}")
+            prompt_text = audio_encoder(audio_path)
+        else:
+            prompt_text = ""
 
-def text_to_speech(text, path="speech_answer.wav"):
-    speaker = list(tts_model.hps.data.spk2id.keys())[0]
-    tts_model.tts_to_file(text, tts_model.hps.data.spk2id[speaker], path)
-    return path
+        # Handle Text
+        question = text_input.value.strip()
+        if question != "":
+            prompt_text += " " + question
 
-def generate_text(prompt, image=None):
-    system_prompt = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
-    if image is not None:
-        image_tensor = image_processor(image, return_tensors="pt")["pixel_values"][0].unsqueeze(0).to(DEVICE)
-        formatted_prompt = f"{system_prompt}\n<|im_start|>user\n{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to(DEVICE)
-        outputs = model.generate(inputs=input_ids, images=image_tensor, max_new_tokens=1024, do_sample=True)
-    else:
-        formatted_prompt = f"{system_prompt}\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to(DEVICE)
-        outputs = model.generate(inputs=input_ids, max_new_tokens=1024, do_sample=True)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if prompt_text == "":
+            print("No question or audio provided!")
+            return
 
-def handle_submit(btn):
-    clear_output(wait=True)
-    prompt_text = text_input.value if text_input.value else uploaded_prompt if 'uploaded_prompt' in globals() else ""
-    if prompt_text == "":
-        print("Please provide a question via text or audio.")
-        display(ui)
-        return
-    answer = generate_text(prompt_text, image=uploaded_image if 'uploaded_image' in globals() else None)
-    print("Prompt:", prompt_text)
-    print("Answer:", answer)
-    speech_path = text_to_speech(answer)
-    display(Audio(speech_path))
-    display(ui)
+        # Format Prompt
+        system_text = "<|im_start|>system\nYou are a helpful speech-text-vision assistant.<|im_end|>"
+        if image_tensor is not None:
+            formatted_prompt = f"{system_text}\n<|im_start|>user\n{DEFAULT_IM_START_TOKEN}{DEFAULT_IMAGE_TOKEN*256}{DEFAULT_IM_END_TOKEN}\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            formatted_prompt = f"{system_text}\n<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
 
-# =====================================================
-# WIDGETS
-# =====================================================
-image_upload = FileUpload(accept="image/*", multiple=False)
-image_upload.observe(handle_image_upload, names="value")
+        # Generate Response
+        input_ids = tokenizer([formatted_prompt], return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+        if image_tensor is not None:
+            image_tensor = image_tensor.unsqueeze(0)
+        outputs = model.generate(inputs=input_ids, images=image_tensor, max_new_tokens=1024, temperature=0.7, top_p=1.0)
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print("************************************************* OUTPUT *************************************************")
+        print(response)
 
-audio_upload = FileUpload(accept="audio/*", multiple=False)
-audio_upload.observe(handle_audio_upload, names="value")
+def on_reset(btn):
+    image_upload.value.clear()
+    audio_upload.value.clear()
+    text_input.value = ""
+    with output_log:
+        clear_output()
+        print("All inputs and outputs have been reset.")
 
-text_input = Text(value="", placeholder="Type your question here...", description="Question:")
-submit_btn = Button(description="Submit", button_style="success")
-submit_btn.on_click(handle_submit)
+submit_button.on_click(on_submit)
+reset_button.on_click(on_reset)
 
-ui = VBox([
-    HBox([image_upload, audio_upload]),
-    text_input,
-    submit_btn
-])
-
+# ----------------------------
+# 4️⃣ Display UI
+# ----------------------------
+ui = widgets.VBox([text_input, image_upload, audio_upload, widgets.HBox([submit_button, reset_button]), output_log])
 display(ui)
